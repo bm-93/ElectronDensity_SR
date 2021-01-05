@@ -1,0 +1,120 @@
+import argparse
+import os
+import numpy as np
+import math
+import itertools
+import datetime
+import sys
+import h5py
+import torch
+import time
+
+from time import gmtime, strftime
+import torchvision.transforms as transforms
+from torchvision.utils import save_image
+from torch.utils.data import DataLoader
+from torchvision import datasets
+from torch.autograd import Variable
+import torch.nn as nn
+import torch.nn.functional as F
+from scipy.spatial.distance import directed_hausdorff
+
+from models import *
+from dataset import EMDataset, UnalignEMDataset
+from dice_loss import diceloss
+
+
+def test():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--n_cpu", type=int, default=8, help="number of cpu threads to use during batch generation")
+    parser.add_argument("--img_height", type=int, default=64, help="size of image height")
+    parser.add_argument("--img_width", type=int, default=64, help="size of image width")
+    parser.add_argument("--img_depth", type=int, default=64, help="size of image depth")
+    parser.add_argument("--channels", type=int, default=1, help="number of image channels")
+    parser.add_argument("--disc_update", type=int, default=5, help="only update discriminator every n iter")
+    parser.add_argument("--d_threshold", type=int, default=.8, help="discriminator threshold")
+    parser.add_argument("--threshold", type=int, default=-1, help="threshold during sampling, -1: No thresholding")
+    parser.add_argument("--sample_interval", type=int, default=20, help="interval between sampling of images from generators")
+    parser.add_argument("--checkpoint_interval", type=int, default=-1, help="interval between model checkpoints")
+    parser.add_argument("--model_dir", type=str, default="07210038_cyclegan", help="directory to load models")
+    parser.add_argument("--save_dir", type=str, default="test", help="directory to save test results")
+    opt = parser.parse_args()
+    print(opt)
+
+    image_folder = os.path.join(opt.save_dir, opt.model_dir)
+    os.makedirs(image_folder, exist_ok=True)
+    os.makedirs(image_folder+'_npy', exist_ok=True)
+
+    cuda = True if torch.cuda.is_available() else False
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    torch.cuda.set_device(device)
+
+    # Loss functions
+    criterion_GAN = torch.nn.MSELoss()
+    criterion_cycle = torch.nn.L1Loss()
+    criterion_identity = torch.nn.L1Loss()
+
+    # Calculate output of image discriminator (PatchGAN)
+    patch = (1, opt.img_height // 2 ** 4, opt.img_width // 2 ** 4, opt.img_depth // 2 ** 4)
+
+    # Initialize generator and discriminator
+    G_AB = GeneratorUNet()
+    # discriminator = Discriminator()
+
+    if cuda:
+        G_AB = G_AB.cuda()
+
+    # load models
+    G_AB.load_state_dict(torch.load("saved_models/%s/G_AB.pth" % (opt.model_dir), map_location=device))
+
+    # Configure dataloaders
+    transforms_ = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+
+    val_dataloader = DataLoader(
+        UnalignEMDataset("data/test", "data_cryoem/test", transforms_=transforms_),
+        batch_size=1,
+        shuffle=True,
+        num_workers=1,
+    )
+
+    # Tensor type
+    Tensor = torch.cuda.FloatTensor if cuda else torch.FloatTensor
+
+    # ----------
+    #  Testing
+    # ----------
+
+    min_val = -1.5
+    max_val = 2.5
+    l1_error_pred, l1_error_input = [], []
+    l2_error_pred, l2_error_input = [], []
+    hausdorff_pred, hausdorff_input = [], []
+
+    for i, batch in enumerate(val_dataloader):
+        info = batch["info_A"]
+        cryoem = Variable(batch["A"].unsqueeze_(1).type(Tensor))
+        pred = G_AB(cryoem)
+
+        # convert to numpy arrays
+        pred = pred.cpu().detach().numpy()
+        pred = (pred * 0.5 + 0.5) * (max_val - min_val) + min_val
+
+        save_fn = info[0].split('/')[-1] + '.h5'
+        save_path = os.path.join(image_folder, save_fn)
+        hf = h5py.File(save_path, 'w')
+        hf.create_dataset('data', data=pred)
+        hf.close()
+
+        save_fn = info[0].split('/')[-1] + '.npy'
+        save_path = os.path.join(image_folder+'_npy', save_fn)
+        np.save(save_path, pred)
+
+        print("{} saved!".format(save_path))
+
+
+if __name__ == '__main__':
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '0'
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    test()
